@@ -28,6 +28,7 @@ import scala.collection.immutable.TreeMap
 import scala.util.matching.Regex
 
 import org.apache.kyuubi.{Logging, Utils}
+import org.apache.kyuubi.config.ConfigAudience.SERVER
 import org.apache.kyuubi.config.KyuubiConf._
 import org.apache.kyuubi.engine.{EngineType, ShareLevel}
 import org.apache.kyuubi.engine.deploy.DeployMode
@@ -193,16 +194,6 @@ case class KyuubiConf(loadSysDefault: Boolean = true) extends Logging {
     cloned
   }
 
-  private lazy val serverOnlyPrefixes: Set[String] = get(KyuubiConf.SERVER_ONLY_PREFIXES)
-  private lazy val serverOnlyPrefixConfigKeys: Set[String] = settings.keys().asScala
-    // for ConfigEntry, respect the serverOnly flag and exclude it here
-    .filter(key => getConfigEntry(key) == null)
-    .filter { key =>
-      serverOnlyPrefixes.exists { prefix =>
-        key.startsWith(prefix)
-      }
-    }.toSet
-
   def getUserDefaults(user: String): KyuubiConf = {
     val cloned = KyuubiConf(false)
 
@@ -214,9 +205,45 @@ case class KyuubiConf(loadSysDefault: Boolean = true) extends Logging {
         getAllWithPrefix(s"$USER_DEFAULTS_CONF_QUOTE${user}$USER_DEFAULTS_CONF_QUOTE", "")) {
       cloned.set(k, v)
     }
-    serverOnlyConfEntries.foreach(cloned.unset)
-    serverOnlyPrefixConfigKeys.foreach(cloned.unset)
     cloned
+  }
+
+  def getEngineConf(engineType: EngineType.EngineType): Map[String, String] = {
+    val targetAudience = ConfigAudience.fromEngineType(engineType)
+    val extraServerPrefixes = get(KyuubiConf.SERVER_ONLY_PREFIXES)
+
+    def resolveAudience(key: String): Set[ConfigAudience.Value] = {
+      if (KyuubiReservedKeys.reservedKeys.contains(key)) {
+        Set(ConfigAudience.ANY)
+      } else {
+        val entry = KyuubiConf.getConfigEntryOrAlternative(key)
+        if (entry != null && entry.audience.isDefined) {
+          entry.audience.get
+        } else if (extraServerPrefixes.exists(prefix => key.startsWith(prefix))) {
+          Set(ConfigAudience.SERVER)
+        } else {
+          ConfigAudience.inferAudience(key)
+        }
+      }
+    }
+
+    val filtered = getAll.filter { case (key, _) =>
+      ConfigAudience.isAudienceMatch(resolveAudience(key), targetAudience)
+    }
+
+    val resolved = KyuubiConf.getFallbackEntries.flatMap { entry =>
+      if (!filtered.contains(entry.key) &&
+        ConfigAudience.isAudienceMatch(resolveAudience(entry.key), targetAudience) &&
+        !ConfigAudience.isAudienceMatch(resolveAudience(entry.fallbackKey), targetAudience)) {
+        val value = get(entry.asInstanceOf[ConfigEntry[Any]])
+        val strValue = entry.strConverter.asInstanceOf[Any => String](value)
+        if (strValue != null && strValue != entry.defaultValStr) {
+          Some(entry.key -> strValue)
+        } else None
+      } else None
+    }.toMap
+
+    filtered ++ resolved
   }
 
   /**
@@ -259,7 +286,12 @@ object KyuubiConf {
   private[this] var kyuubiConfEntries: java.util.Map[String, ConfigEntry[_]] =
     java.util.Collections.emptyMap()
 
-  private var serverOnlyConfEntries: Set[ConfigEntry[_]] = Set()
+  @volatile
+  private[this] var alternativeKeyEntries: java.util.Map[String, ConfigEntry[_]] =
+    java.util.Collections.emptyMap()
+
+  @volatile
+  private[this] var fallbackEntries: Set[ConfigEntryFallback[_]] = Set.empty
 
   private[config] def register(entry: ConfigEntry[_]): Unit =
     kyuubiConfEntriesUpdateLock.synchronized {
@@ -269,10 +301,22 @@ object KyuubiConf {
       val updatedMap = new java.util.HashMap[String, ConfigEntry[_]](kyuubiConfEntries)
       updatedMap.put(entry.key, entry)
       kyuubiConfEntries = updatedMap
-      if (entry.serverOnly) {
-        serverOnlyConfEntries += entry
+      if (entry.alternatives.nonEmpty) {
+        val updatedAltMap = new java.util.HashMap[String, ConfigEntry[_]](alternativeKeyEntries)
+        entry.alternatives.foreach(updatedAltMap.put(_, entry))
+        alternativeKeyEntries = updatedAltMap
+      }
+      entry match {
+        case fb: ConfigEntryFallback[_] =>
+          fallbackEntries += fb
+        case _ =>
       }
     }
+
+  private[kyuubi] def isImmutableKey(key: String): Boolean = {
+    val entry = getConfigEntryOrAlternative(key)
+    entry != null && entry.immutable
+  }
 
   // For testing only
   private[config] def unregister(entry: ConfigEntry[_]): Unit =
@@ -280,15 +324,33 @@ object KyuubiConf {
       val updatedMap = new java.util.HashMap[String, ConfigEntry[_]](kyuubiConfEntries)
       updatedMap.remove(entry.key)
       kyuubiConfEntries = updatedMap
+      if (entry.alternatives.nonEmpty) {
+        val updatedAltMap = new java.util.HashMap[String, ConfigEntry[_]](alternativeKeyEntries)
+        entry.alternatives.foreach(updatedAltMap.remove)
+        alternativeKeyEntries = updatedAltMap
+      }
+      entry match {
+        case fb: ConfigEntryFallback[_] =>
+          fallbackEntries -= fb
+        case _ =>
+      }
     }
 
   private[config] def getConfigEntry(key: String): ConfigEntry[_] = {
     kyuubiConfEntries.get(key)
   }
 
+  private[kyuubi] def getConfigEntryOrAlternative(key: String): ConfigEntry[_] = {
+    val entry = kyuubiConfEntries.get(key)
+    if (entry != null) entry else alternativeKeyEntries.get(key)
+  }
+
   private[config] def getConfigEntries(): java.util.Collection[ConfigEntry[_]] = {
     kyuubiConfEntries.values()
   }
+
+  private[config] def getFallbackEntries: Set[ConfigEntryFallback[_]] =
+    fallbackEntries
 
   private[config] def containsConfigEntry(entry: ConfigEntry[_]): Boolean = {
     getConfigEntry(entry.key) == entry
@@ -301,21 +363,24 @@ object KyuubiConf {
   val SERVER_PRINCIPAL: OptionalConfigEntry[String] = buildConf("kyuubi.kinit.principal")
     .doc("Name of the Kerberos principal.")
     .version("1.0.0")
-    .serverOnly
+    .audience(SERVER)
+    .immutable
     .stringConf
     .createOptional
 
   val SERVER_KEYTAB: OptionalConfigEntry[String] = buildConf("kyuubi.kinit.keytab")
     .doc("Location of Kyuubi server's keytab.")
     .version("1.0.0")
-    .serverOnly
+    .audience(SERVER)
+    .immutable
     .stringConf
     .createOptional
 
   val SERVER_SPNEGO_KEYTAB: OptionalConfigEntry[String] = buildConf("kyuubi.spnego.keytab")
     .doc("Keytab file for SPNego principal")
     .version("1.6.0")
-    .serverOnly
+    .audience(SERVER)
+    .immutable
     .stringConf
     .createOptional
 
@@ -324,7 +389,8 @@ object KyuubiConf {
       " SPNego service principal would be used when restful Kerberos security is enabled." +
       " This needs to be set only if SPNEGO is to be used in authentication.")
     .version("1.6.0")
-    .serverOnly
+    .audience(SERVER)
+    .immutable
     .stringConf
     .createOptional
 
@@ -332,12 +398,14 @@ object KyuubiConf {
     .doc("How often will the Kyuubi server run `kinit -kt [keytab] [principal]` to renew the" +
       " local Kerberos credentials cache")
     .version("1.0.0")
-    .serverOnly
+    .audience(SERVER)
+    .immutable
     .timeConf
     .createWithDefaultString("PT1H")
 
   val KINIT_MAX_ATTEMPTS: ConfigEntry[Int] = buildConf("kyuubi.kinit.max.attempts")
-    .serverOnly
+    .audience(SERVER)
+    .immutable
     .doc("How many times will `kinit` process retry")
     .version("1.0.0")
     .intConf
@@ -351,7 +419,8 @@ object KyuubiConf {
 
   val CREDENTIALS_RENEWAL_INTERVAL: ConfigEntry[Long] =
     buildConf("kyuubi.credentials.renewal.interval")
-      .serverOnly
+      .audience(SERVER)
+      .immutable
       .doc("How often Kyuubi renews one user's delegation tokens")
       .version("1.4.0")
       .timeConf
@@ -359,7 +428,8 @@ object KyuubiConf {
 
   val CREDENTIALS_RENEWAL_RETRY_WAIT: ConfigEntry[Long] =
     buildConf("kyuubi.credentials.renewal.retry.wait")
-      .serverOnly
+      .audience(SERVER)
+      .immutable
       .doc("How long to wait before retrying to fetch new credentials after a failure.")
       .version("1.4.0")
       .timeConf
@@ -368,7 +438,8 @@ object KyuubiConf {
 
   val CREDENTIALS_UPDATE_WAIT_TIMEOUT: ConfigEntry[Long] =
     buildConf("kyuubi.credentials.update.wait.timeout")
-      .serverOnly
+      .audience(SERVER)
+      .immutable
       .doc("How long to wait until the credentials are ready.")
       .version("1.5.0")
       .timeConf
@@ -377,7 +448,8 @@ object KyuubiConf {
 
   val CREDENTIALS_CHECK_INTERVAL: ConfigEntry[Long] =
     buildConf("kyuubi.credentials.check.interval")
-      .serverOnly
+      .audience(SERVER)
+      .immutable
       .doc("The interval to check the expiration of cached <user, CredentialsRef> pairs.")
       .version("1.6.0")
       .timeConf
@@ -386,7 +458,8 @@ object KyuubiConf {
 
   val CREDENTIALS_IDLE_TIMEOUT: ConfigEntry[Long] =
     buildConf("kyuubi.credentials.idle.timeout")
-      .serverOnly
+      .audience(SERVER)
+      .immutable
       .doc("The inactive users' credentials will be expired after a configured timeout")
       .version("1.6.0")
       .timeConf
@@ -402,7 +475,8 @@ object KyuubiConf {
 
   val CREDENTIALS_HADOOP_FS_URIS: ConfigEntry[Seq[String]] =
     buildConf("kyuubi.credentials.hadoopfs.uris")
-      .serverOnly
+      .audience(SERVER)
+      .immutable
       .doc("Extra Hadoop filesystem URIs for which to request delegation tokens. " +
         "The filesystem that hosts fs.defaultFS does not need to be listed here.")
       .version("1.4.0")
@@ -428,7 +502,8 @@ object KyuubiConf {
 
   val FRONTEND_PROTOCOLS: ConfigEntry[Seq[String]] =
     buildConf("kyuubi.frontend.protocols")
-      .serverOnly
+      .audience(SERVER)
+      .immutable
       .doc("A comma-separated list for all frontend protocols " +
         "<ul>" +
         " <li>THRIFT_BINARY - HiveServer2 compatible thrift binary protocol.</li>" +
@@ -449,7 +524,8 @@ object KyuubiConf {
   val FRONTEND_BIND_HOST: OptionalConfigEntry[String] = buildConf("kyuubi.frontend.bind.host")
     .doc("Hostname or IP of the machine on which to run the frontend services.")
     .version("1.0.0")
-    .serverOnly
+    .audience(SERVER)
+    .immutable
     .stringConf
     .createOptional
 
@@ -459,7 +535,8 @@ object KyuubiConf {
         "external systems such as the service discovery ensemble and metadata store. " +
         "Use it when you want to advertise a different hostname or IP than the bind host.")
       .version("1.8.0")
-      .serverOnly
+      .audience(SERVER)
+      .immutable
       .stringConf
       .createOptional
 
@@ -468,12 +545,14 @@ object KyuubiConf {
       .doc("Hostname or IP of the machine on which to run the thrift frontend service " +
         "via the binary protocol.")
       .version("1.4.0")
-      .serverOnly
+      .audience(SERVER)
+      .immutable
       .fallbackConf(FRONTEND_BIND_HOST)
 
   val FRONTEND_THRIFT_BINARY_SSL_ENABLED: ConfigEntry[Boolean] =
     buildConf("kyuubi.frontend.thrift.binary.ssl.enabled")
-      .serverOnly
+      .audience(SERVER)
+      .immutable
       .doc("Set this to true for using SSL encryption in thrift binary frontend server.")
       .version("1.7.0")
       .booleanConf
@@ -481,7 +560,8 @@ object KyuubiConf {
 
   val FRONTEND_SSL_KEYSTORE_PATH: OptionalConfigEntry[String] =
     buildConf("kyuubi.frontend.ssl.keystore.path")
-      .serverOnly
+      .audience(SERVER)
+      .immutable
       .doc("SSL certificate keystore location.")
       .version("1.7.0")
       .stringConf
@@ -491,13 +571,15 @@ object KyuubiConf {
     buildConf("kyuubi.frontend.ssl.keystore.password")
       .doc("SSL certificate keystore password.")
       .version("1.7.0")
-      .serverOnly
+      .audience(SERVER)
+      .immutable
       .stringConf
       .createOptional
 
   val FRONTEND_SSL_KEYSTORE_TYPE: OptionalConfigEntry[String] =
     buildConf("kyuubi.frontend.ssl.keystore.type")
-      .serverOnly
+      .audience(SERVER)
+      .immutable
       .doc("SSL certificate keystore type.")
       .version("1.7.0")
       .stringConf
@@ -505,7 +587,8 @@ object KyuubiConf {
 
   val FRONTEND_SSL_KEYSTORE_ALGORITHM: OptionalConfigEntry[String] =
     buildConf("kyuubi.frontend.ssl.keystore.algorithm")
-      .serverOnly
+      .audience(SERVER)
+      .immutable
       .doc("SSL certificate keystore algorithm.")
       .version("1.7.0")
       .stringConf
@@ -513,7 +596,8 @@ object KyuubiConf {
 
   val FRONTEND_THRIFT_BINARY_SSL_DISALLOWED_PROTOCOLS: ConfigEntry[Set[String]] =
     buildConf("kyuubi.frontend.thrift.binary.ssl.disallowed.protocols")
-      .serverOnly
+      .audience(SERVER)
+      .immutable
       .doc("SSL versions to disallow for Kyuubi thrift binary frontend.")
       .version("1.7.0")
       .stringConf
@@ -522,7 +606,8 @@ object KyuubiConf {
 
   val FRONTEND_THRIFT_BINARY_SSL_INCLUDE_CIPHER_SUITES: ConfigEntry[Seq[String]] =
     buildConf("kyuubi.frontend.thrift.binary.ssl.include.ciphersuites")
-      .serverOnly
+      .audience(SERVER)
+      .immutable
       .doc("A comma-separated list of include SSL cipher suite names for thrift binary frontend.")
       .version("1.7.0")
       .stringConf
@@ -534,7 +619,8 @@ object KyuubiConf {
     .doc("(deprecated) Port of the machine on which to run the thrift frontend service " +
       "via the binary protocol.")
     .version("1.0.0")
-    .serverOnly
+    .audience(SERVER)
+    .immutable
     .intConf
     .checkValue(p => p == 0 || (p > 1024 && p < 65535), "Invalid Port number")
     .createWithDefault(10009)
@@ -544,7 +630,8 @@ object KyuubiConf {
       .doc("Port of the machine on which to run the thrift frontend service " +
         "via the binary protocol.")
       .version("1.4.0")
-      .serverOnly
+      .audience(SERVER)
+      .immutable
       .fallbackConf(FRONTEND_BIND_PORT)
 
   val FRONTEND_THRIFT_HTTP_BIND_HOST: ConfigEntry[Option[String]] =
@@ -552,14 +639,16 @@ object KyuubiConf {
       .doc("Hostname or IP of the machine on which to run the thrift frontend service " +
         "via http protocol.")
       .version("1.6.0")
-      .serverOnly
+      .audience(SERVER)
+      .immutable
       .fallbackConf(FRONTEND_BIND_HOST)
 
   val FRONTEND_THRIFT_HTTP_BIND_PORT: ConfigEntry[Int] =
     buildConf("kyuubi.frontend.thrift.http.bind.port")
       .doc("Port of the machine on which to run the thrift frontend service via http protocol.")
       .version("1.6.0")
-      .serverOnly
+      .audience(SERVER)
+      .immutable
       .intConf
       .checkValue(p => p == 0 || (p > 1024 && p < 65535), "Invalid Port number")
       .createWithDefault(10010)
@@ -596,7 +685,8 @@ object KyuubiConf {
 
   val FRONTEND_REST_MAX_WORKER_THREADS: ConfigEntry[Int] =
     buildConf("kyuubi.frontend.rest.max.worker.threads")
-      .serverOnly
+      .audience(SERVER)
+      .immutable
       .doc("Maximum number of threads in the frontend worker thread pool for the rest " +
         "frontend service")
       .version("1.6.2")
@@ -604,7 +694,8 @@ object KyuubiConf {
 
   val FRONTEND_REST_PROXY_JETTY_CLIENT_IDLE_TIMEOUT: ConfigEntry[Long] =
     buildConf("kyuubi.frontend.rest.proxy.jetty.client.idleTimeout")
-      .serverOnly
+      .audience(SERVER)
+      .immutable
       .doc("The idle timeout in milliseconds for Jetty server " +
         "used by the RESTful frontend service.")
       .version("1.10.0")
@@ -613,7 +704,8 @@ object KyuubiConf {
 
   val FRONTEND_REST_PROXY_JETTY_CLIENT_MAX_CONNECTIONS: ConfigEntry[Int] =
     buildConf("kyuubi.frontend.rest.proxy.jetty.client.maxConnections")
-      .serverOnly
+      .audience(SERVER)
+      .immutable
       .doc("The max number of connections per destination for Jetty server " +
         "used by the RESTful frontend service.")
       .version("1.10.0")
@@ -622,7 +714,8 @@ object KyuubiConf {
 
   val FRONTEND_REST_PROXY_JETTY_CLIENT_MAX_THREADS: ConfigEntry[Int] =
     buildConf("kyuubi.frontend.rest.proxy.jetty.client.maxThreads")
-      .serverOnly
+      .audience(SERVER)
+      .immutable
       .doc("The max number of threads of HttpClient's Executor for Jetty server " +
         "used by the RESTful frontend service.")
       .version("1.10.0")
@@ -631,7 +724,8 @@ object KyuubiConf {
 
   val FRONTEND_REST_PROXY_JETTY_CLIENT_REQUEST_BUFFER_SIZE: ConfigEntry[Int] =
     buildConf("kyuubi.frontend.rest.proxy.jetty.client.requestBufferSize")
-      .serverOnly
+      .audience(SERVER)
+      .immutable
       .doc("Size of the buffer in bytes used to write requests for Jetty server " +
         "used by the RESTful frontend service.")
       .version("1.10.0")
@@ -640,7 +734,8 @@ object KyuubiConf {
 
   val FRONTEND_REST_PROXY_JETTY_CLIENT_RESPONSE_BUFFER_SIZE: ConfigEntry[Int] =
     buildConf("kyuubi.frontend.rest.proxy.jetty.client.responseBufferSize")
-      .serverOnly
+      .audience(SERVER)
+      .immutable
       .doc("Size of the buffer in bytes used to read response for Jetty server " +
         "used by the RESTful frontend service.")
       .version("1.10.0")
@@ -649,7 +744,8 @@ object KyuubiConf {
 
   val FRONTEND_REST_PROXY_JETTY_CLIENT_TIMEOUT: ConfigEntry[Long] =
     buildConf("kyuubi.frontend.rest.proxy.jetty.client.timeout")
-      .serverOnly
+      .audience(SERVER)
+      .immutable
       .doc("The total timeout in milliseconds for Jetty server " +
         "used by the RESTful frontend service.")
       .version("1.10.0")
@@ -658,7 +754,8 @@ object KyuubiConf {
 
   val FRONTEND_REST_ENGINE_UI_PROXY_ENABLED: ConfigEntry[Boolean] =
     buildConf("kyuubi.frontend.rest.engine.ui.proxy.enabled")
-      .serverOnly
+      .audience(SERVER)
+      .immutable
       .doc("Whether to route Engine UI traffic via Kyuubi REST frontend proxy. When disabled, " +
         "the Web UI links directly to the Kyuubi engine URL.")
       .version("1.12.0")
@@ -667,7 +764,8 @@ object KyuubiConf {
 
   val FRONTEND_REST_ENGINE_UI_PROXY_HOSTS: ConfigEntry[Seq[String]] =
     buildConf("kyuubi.frontend.rest.engine.ui.proxy.hosts")
-      .serverOnly
+      .audience(SERVER)
+      .immutable
       .doc("A comma-separated list of hosts that Engine UI proxy requests can route to when " +
         s"`${FRONTEND_REST_ENGINE_UI_PROXY_ENABLED.key}` is enabled. " +
         "Host matching is case-insensitive and supports `*` as a wildcard, for example, " +
@@ -679,7 +777,8 @@ object KyuubiConf {
 
   val FRONTEND_REST_JETTY_STOP_TIMEOUT: ConfigEntry[Long] =
     buildConf("kyuubi.frontend.rest.jetty.stopTimeout")
-      .serverOnly
+      .audience(SERVER)
+      .immutable
       .doc("Stop timeout for Jetty server used by the RESTful frontend service.")
       .version("1.8.1")
       .timeConf
@@ -687,7 +786,8 @@ object KyuubiConf {
 
   val FRONTEND_REST_UI_ENABLED: ConfigEntry[Boolean] =
     buildConf("kyuubi.frontend.rest.ui.enabled")
-      .serverOnly
+      .audience(SERVER)
+      .immutable
       .doc("Whether to enable Web UI when RESTful protocol is enabled")
       .version("1.10.0")
       .booleanConf
@@ -729,7 +829,8 @@ object KyuubiConf {
 
   val FRONTEND_THRIFT_HTTP_REQUEST_HEADER_SIZE: ConfigEntry[Int] =
     buildConf("kyuubi.frontend.thrift.http.request.header.size")
-      .serverOnly
+      .audience(SERVER)
+      .immutable
       .doc("Request header size in bytes, when using HTTP transport mode. Jetty defaults used.")
       .version("1.6.0")
       .intConf
@@ -737,7 +838,8 @@ object KyuubiConf {
 
   val FRONTEND_THRIFT_HTTP_RESPONSE_HEADER_SIZE: ConfigEntry[Int] =
     buildConf("kyuubi.frontend.thrift.http.response.header.size")
-      .serverOnly
+      .audience(SERVER)
+      .immutable
       .doc("Response header size in bytes, when using HTTP transport mode. Jetty defaults used.")
       .version("1.6.0")
       .intConf
@@ -745,7 +847,8 @@ object KyuubiConf {
 
   val FRONTEND_THRIFT_HTTP_MAX_IDLE_TIME: ConfigEntry[Long] =
     buildConf("kyuubi.frontend.thrift.http.max.idle.time")
-      .serverOnly
+      .audience(SERVER)
+      .immutable
       .doc("Maximum idle time for a connection on the server when in HTTP mode.")
       .version("1.6.0")
       .timeConf
@@ -753,7 +856,8 @@ object KyuubiConf {
 
   val FRONTEND_THRIFT_HTTP_PATH: ConfigEntry[String] =
     buildConf("kyuubi.frontend.thrift.http.path")
-      .serverOnly
+      .audience(SERVER)
+      .immutable
       .doc("Path component of URL endpoint when in HTTP mode.")
       .version("1.6.0")
       .stringConf
@@ -761,7 +865,8 @@ object KyuubiConf {
 
   val FRONTEND_THRIFT_HTTP_COMPRESSION_ENABLED: ConfigEntry[Boolean] =
     buildConf("kyuubi.frontend.thrift.http.compression.enabled")
-      .serverOnly
+      .audience(SERVER)
+      .immutable
       .doc("Enable thrift http compression via Jetty compression support")
       .version("1.6.0")
       .booleanConf
@@ -769,7 +874,8 @@ object KyuubiConf {
 
   val FRONTEND_JETTY_SEND_VERSION_ENABLED: ConfigEntry[Boolean] =
     buildConf("kyuubi.frontend.jetty.sendVersion.enabled")
-      .serverOnly
+      .audience(SERVER)
+      .immutable
       .doc("Whether to send Jetty version in HTTP response.")
       .version("1.9.3")
       .booleanConf
@@ -777,7 +883,8 @@ object KyuubiConf {
 
   val FRONTEND_THRIFT_HTTP_COOKIE_AUTH_ENABLED: ConfigEntry[Boolean] =
     buildConf("kyuubi.frontend.thrift.http.cookie.auth.enabled")
-      .serverOnly
+      .audience(SERVER)
+      .immutable
       .doc("When true, Kyuubi in HTTP transport mode, " +
         "will use cookie-based authentication mechanism")
       .version("1.6.0")
@@ -786,7 +893,8 @@ object KyuubiConf {
 
   val FRONTEND_THRIFT_HTTP_COOKIE_MAX_AGE: ConfigEntry[Int] =
     buildConf("kyuubi.frontend.thrift.http.cookie.max.age")
-      .serverOnly
+      .audience(SERVER)
+      .immutable
       .doc("Maximum age in seconds for server side cookie used by Kyuubi in HTTP mode.")
       .version("1.6.0")
       .intConf
@@ -794,7 +902,8 @@ object KyuubiConf {
 
   val FRONTEND_THRIFT_HTTP_COOKIE_DOMAIN: OptionalConfigEntry[String] =
     buildConf("kyuubi.frontend.thrift.http.cookie.domain")
-      .serverOnly
+      .audience(SERVER)
+      .immutable
       .doc("Domain for the Kyuubi generated cookies")
       .version("1.6.0")
       .stringConf
@@ -802,7 +911,8 @@ object KyuubiConf {
 
   val FRONTEND_THRIFT_HTTP_COOKIE_PATH: OptionalConfigEntry[String] =
     buildConf("kyuubi.frontend.thrift.http.cookie.path")
-      .serverOnly
+      .audience(SERVER)
+      .immutable
       .doc("Path for the Kyuubi generated cookies")
       .version("1.6.0")
       .stringConf
@@ -810,7 +920,8 @@ object KyuubiConf {
 
   val FRONTEND_THRIFT_HTTP_COOKIE_IS_HTTPONLY: ConfigEntry[Boolean] =
     buildConf("kyuubi.frontend.thrift.http.cookie.is.httponly")
-      .serverOnly
+      .audience(SERVER)
+      .immutable
       .doc("HttpOnly attribute of the Kyuubi generated cookie.")
       .version("1.6.0")
       .booleanConf
@@ -818,7 +929,8 @@ object KyuubiConf {
 
   val FRONTEND_THRIFT_HTTP_XSRF_FILTER_ENABLED: ConfigEntry[Boolean] =
     buildConf("kyuubi.frontend.thrift.http.xsrf.filter.enabled")
-      .serverOnly
+      .audience(SERVER)
+      .immutable
       .doc("If enabled, Kyuubi will block any requests made to it over HTTP " +
         "if an X-XSRF-HEADER header is not present")
       .version("1.6.0")
@@ -827,7 +939,8 @@ object KyuubiConf {
 
   val FRONTEND_THRIFT_HTTP_USE_SSL: ConfigEntry[Boolean] =
     buildConf("kyuubi.frontend.thrift.http.use.SSL")
-      .serverOnly
+      .audience(SERVER)
+      .immutable
       .doc("Set this to true for using SSL encryption in http mode.")
       .version("1.6.0")
       .booleanConf
@@ -835,7 +948,8 @@ object KyuubiConf {
 
   val FRONTEND_THRIFT_HTTP_SSL_KEYSTORE_PATH: OptionalConfigEntry[String] =
     buildConf("kyuubi.frontend.thrift.http.ssl.keystore.path")
-      .serverOnly
+      .audience(SERVER)
+      .immutable
       .doc("SSL certificate keystore location.")
       .version("1.6.0")
       .withAlternative("kyuubi.frontend.ssl.keystore.path")
@@ -846,14 +960,16 @@ object KyuubiConf {
     buildConf("kyuubi.frontend.thrift.http.ssl.keystore.password")
       .doc("SSL certificate keystore password.")
       .version("1.6.0")
-      .serverOnly
+      .audience(SERVER)
+      .immutable
       .withAlternative("kyuubi.frontend.ssl.keystore.password")
       .stringConf
       .createOptional
 
   val FRONTEND_THRIFT_HTTP_SSL_PROTOCOL_BLACKLIST: ConfigEntry[Seq[String]] =
     buildConf("kyuubi.frontend.thrift.http.ssl.protocol.blacklist")
-      .serverOnly
+      .audience(SERVER)
+      .immutable
       .doc("SSL Versions to disable when using HTTP transport mode.")
       .version("1.6.0")
       .stringConf
@@ -862,7 +978,8 @@ object KyuubiConf {
 
   val FRONTEND_THRIFT_HTTP_SSL_EXCLUDE_CIPHER_SUITES: ConfigEntry[Seq[String]] =
     buildConf("kyuubi.frontend.thrift.http.ssl.exclude.ciphersuites")
-      .serverOnly
+      .audience(SERVER)
+      .immutable
       .doc("A comma-separated list of exclude SSL cipher suite names for thrift http frontend.")
       .version("1.7.0")
       .stringConf
@@ -871,7 +988,8 @@ object KyuubiConf {
 
   val FRONTEND_PROXY_HTTP_CLIENT_IP_HEADER: ConfigEntry[String] =
     buildConf("kyuubi.frontend.proxy.http.client.ip.header")
-      .serverOnly
+      .audience(SERVER)
+      .immutable
       .doc("The HTTP header to record the real client IP address. If your server is behind a load" +
         " balancer or other proxy, the server will see this load balancer or proxy IP address as" +
         " the client IP address, to get around this common issue, most load balancers or proxies" +
@@ -915,7 +1033,8 @@ object KyuubiConf {
       " Note that: for SASL authentication, KERBEROS and PLAIN auth types are supported" +
       " at the same time, and only the first specified PLAIN auth type is valid.")
     .version("1.0.0")
-    .serverOnly
+    .audience(SERVER)
+    .immutable
     .stringConf
     .transformToUpperCase
     .toSequence()
@@ -927,7 +1046,8 @@ object KyuubiConf {
       .doc("User-defined authentication implementation of " +
         "org.apache.kyuubi.service.authentication.PasswdAuthenticationProvider")
       .version("1.3.0")
-      .serverOnly
+      .audience(SERVER)
+      .immutable
       .stringConf
       .createOptional
 
@@ -937,7 +1057,8 @@ object KyuubiConf {
         "org.apache.kyuubi.service.authentication.PasswdAuthenticationProvider " +
         "for http basic authentication.")
       .version("1.10.0")
-      .serverOnly
+      .audience(SERVER)
+      .immutable
       .fallbackConf(AUTHENTICATION_CUSTOM_CLASS)
 
   val AUTHENTICATION_CUSTOM_BEARER_CLASS: OptionalConfigEntry[String] =
@@ -946,7 +1067,8 @@ object KyuubiConf {
         "org.apache.kyuubi.service.authentication.TokenAuthenticationProvider " +
         "for http bearer authentication.")
       .version("1.10.0")
-      .serverOnly
+      .audience(SERVER)
+      .immutable
       .stringConf
       .createOptional
 
@@ -954,7 +1076,8 @@ object KyuubiConf {
     buildConf("kyuubi.authentication.ldap.url")
       .doc("SPACE character separated LDAP connection URL(s).")
       .version("1.0.0")
-      .serverOnly
+      .audience(SERVER)
+      .immutable
       .stringConf
       .createOptional
 
@@ -963,7 +1086,8 @@ object KyuubiConf {
       .withAlternative("kyuubi.authentication.ldap.base.dn")
       .doc("LDAP base DN.")
       .version("1.7.0")
-      .serverOnly
+      .audience(SERVER)
+      .immutable
       .stringConf
       .createOptional
 
@@ -971,7 +1095,8 @@ object KyuubiConf {
     buildConf("kyuubi.authentication.ldap.domain")
       .doc("LDAP domain.")
       .version("1.0.0")
-      .serverOnly
+      .audience(SERVER)
+      .immutable
       .stringConf
       .createOptional
 
@@ -981,7 +1106,8 @@ object KyuubiConf {
         "this directory. Use %s where the actual group name is to be substituted for. " +
         "For example: CN=%s,CN=Groups,DC=subdomain,DC=domain,DC=com.")
       .version("1.7.0")
-      .serverOnly
+      .audience(SERVER)
+      .immutable
       .stringConf
       .createOptional
 
@@ -991,7 +1117,8 @@ object KyuubiConf {
         "Use %s where the actual group name is to be substituted for. " +
         "For example: CN=%s,CN=Users,DC=subdomain,DC=domain,DC=com.")
       .version("1.7.0")
-      .serverOnly
+      .audience(SERVER)
+      .immutable
       .stringConf
       .createOptional
 
@@ -1000,7 +1127,8 @@ object KyuubiConf {
       .doc("COMMA-separated list of LDAP Group names (short name not full DNs). " +
         "For example: HiveAdmins,HadoopAdmins,Administrators")
       .version("1.7.0")
-      .serverOnly
+      .audience(SERVER)
+      .immutable
       .stringConf
       .toSet()
       .createWithDefault(Set.empty)
@@ -1010,7 +1138,8 @@ object KyuubiConf {
       .doc("COMMA-separated list of LDAP usernames (just short names, not full DNs). " +
         "For example: hiveuser,impalauser,hiveadmin,hadoopadmin")
       .version("1.7.0")
-      .serverOnly
+      .audience(SERVER)
+      .immutable
       .stringConf
       .toSet()
       .createWithDefault(Set.empty)
@@ -1020,7 +1149,8 @@ object KyuubiConf {
       .doc("LDAP attribute name whose values are unique in this LDAP server. " +
         "For example: uid or CN.")
       .version("1.2.0")
-      .serverOnly
+      .audience(SERVER)
+      .immutable
       .stringConf
       .createWithDefault("uid")
 
@@ -1030,7 +1160,8 @@ object KyuubiConf {
         "names for the user, group, and contact objects that are members of the group. " +
         "For example: member, uniqueMember or memberUid")
       .version("1.7.0")
-      .serverOnly
+      .audience(SERVER)
+      .immutable
       .stringConf
       .createWithDefault("member")
 
@@ -1040,7 +1171,8 @@ object KyuubiConf {
         "a direct member, except for the primary group, which is represented by the " +
         "primaryGroupId. For example: memberOf")
       .version("1.7.0")
-      .serverOnly
+      .audience(SERVER)
+      .immutable
       .stringConf
       .createOptional
 
@@ -1049,7 +1181,8 @@ object KyuubiConf {
       .doc("LDAP attribute name on the group entry that is to be used in LDAP group searches. " +
         "For example: group, groupOfNames or groupOfUniqueNames.")
       .version("1.7.0")
-      .serverOnly
+      .audience(SERVER)
+      .immutable
       .stringConf
       .createWithDefault("groupOfNames")
 
@@ -1063,7 +1196,8 @@ object KyuubiConf {
         "(|(memberOf=CN=Domain Admins,CN=Users,DC=domain,DC=com)" +
         "(memberOf=CN=Administrators,CN=Builtin,DC=domain,DC=com))))`")
       .version("1.7.0")
-      .serverOnly
+      .audience(SERVER)
+      .immutable
       .stringConf
       .createOptional
 
@@ -1075,7 +1209,8 @@ object KyuubiConf {
         "the user being authenticated will be used as the bind user. " +
         "For example: CN=bindUser,CN=Users,DC=subdomain,DC=domain,DC=com")
       .version("1.7.0")
-      .serverOnly
+      .audience(SERVER)
+      .immutable
       .stringConf
       .createOptional
 
@@ -1085,7 +1220,8 @@ object KyuubiConf {
         "user being authenticated. If the username is specified, this parameter must also be " +
         "specified.")
       .version("1.7.0")
-      .serverOnly
+      .audience(SERVER)
+      .immutable
       .stringConf
       .createOptional
 
@@ -1093,7 +1229,8 @@ object KyuubiConf {
     buildConf("kyuubi.authentication.jdbc.driver.class")
       .doc("Driver class name for JDBC Authentication Provider.")
       .version("1.6.0")
-      .serverOnly
+      .audience(SERVER)
+      .immutable
       .stringConf
       .createOptional
 
@@ -1101,7 +1238,8 @@ object KyuubiConf {
     buildConf("kyuubi.authentication.jdbc.url")
       .doc("JDBC URL for JDBC Authentication Provider.")
       .version("1.6.0")
-      .serverOnly
+      .audience(SERVER)
+      .immutable
       .stringConf
       .createOptional
 
@@ -1109,7 +1247,8 @@ object KyuubiConf {
     buildConf("kyuubi.authentication.jdbc.user")
       .doc("Database user for JDBC Authentication Provider.")
       .version("1.6.0")
-      .serverOnly
+      .audience(SERVER)
+      .immutable
       .stringConf
       .createOptional
 
@@ -1117,7 +1256,8 @@ object KyuubiConf {
     buildConf("kyuubi.authentication.jdbc.password")
       .doc("Database password for JDBC Authentication Provider.")
       .version("1.6.0")
-      .serverOnly
+      .audience(SERVER)
+      .immutable
       .stringConf
       .createOptional
 
@@ -1129,7 +1269,8 @@ object KyuubiConf {
         "The SQL statement must start with the `SELECT` clause. " +
         "Available placeholders are `${user}` and `${password}`.")
       .version("1.6.0")
-      .serverOnly
+      .audience(SERVER)
+      .immutable
       .stringConf
       .createOptional
 
@@ -1168,7 +1309,8 @@ object KyuubiConf {
       " <li>auth-conf - authentication plus integrity and confidentiality protection. This is" +
       " applicable only if Kyuubi is configured to use Kerberos authentication.</li> </ul>")
     .version("1.0.0")
-    .serverOnly
+    .audience(SERVER)
+    .immutable
     .stringConf
     .checkValues(SaslQOP)
     .transformToLowerCase
@@ -1178,13 +1320,15 @@ object KyuubiConf {
     buildConf("kyuubi.frontend.rest.bind.host")
       .doc("Hostname or IP of the machine on which to run the REST frontend service.")
       .version("1.4.0")
-      .serverOnly
+      .audience(SERVER)
+      .immutable
       .fallbackConf(FRONTEND_BIND_HOST)
 
   val FRONTEND_REST_BIND_PORT: ConfigEntry[Int] = buildConf("kyuubi.frontend.rest.bind.port")
     .doc("Port of the machine on which to run the REST frontend service.")
     .version("1.4.0")
-    .serverOnly
+    .audience(SERVER)
+    .immutable
     .intConf
     .checkValue(p => p == 0 || (p > 1024 && p < 65535), "Invalid Port number")
     .createWithDefault(10099)
@@ -1193,13 +1337,15 @@ object KyuubiConf {
     buildConf("kyuubi.frontend.mysql.bind.host")
       .doc("Hostname or IP of the machine on which to run the MySQL frontend service.")
       .version("1.4.0")
-      .serverOnly
+      .audience(SERVER)
+      .immutable
       .fallbackConf(FRONTEND_BIND_HOST)
 
   val FRONTEND_MYSQL_BIND_PORT: ConfigEntry[Int] = buildConf("kyuubi.frontend.mysql.bind.port")
     .doc("Port of the machine on which to run the MySQL frontend service.")
     .version("1.4.0")
-    .serverOnly
+    .audience(SERVER)
+    .immutable
     .intConf
     .checkValue(p => p == 0 || (p > 1024 && p < 65535), "Invalid Port number")
     .createWithDefault(3309)
@@ -1216,7 +1362,8 @@ object KyuubiConf {
   val MAX_NETTY_THREADS: Int = 8
   val FRONTEND_MYSQL_NETTY_WORKER_THREADS: OptionalConfigEntry[Int] =
     buildConf("kyuubi.frontend.mysql.netty.worker.threads")
-      .serverOnly
+      .audience(SERVER)
+      .immutable
       .doc("Number of thread in the netty worker event loop of MySQL frontend service. " +
         s"Use min(cpu_cores, $MAX_NETTY_THREADS) in default.")
       .version("1.4.0")
@@ -1228,7 +1375,8 @@ object KyuubiConf {
 
   val FRONTEND_MYSQL_MIN_WORKER_THREADS: ConfigEntry[Int] =
     buildConf("kyuubi.frontend.mysql.min.worker.threads")
-      .serverOnly
+      .audience(SERVER)
+      .immutable
       .doc("Minimum number of threads in the command execution thread pool for the MySQL " +
         "frontend service")
       .version("1.4.0")
@@ -1236,7 +1384,8 @@ object KyuubiConf {
 
   val FRONTEND_MYSQL_MAX_WORKER_THREADS: ConfigEntry[Int] =
     buildConf("kyuubi.frontend.mysql.max.worker.threads")
-      .serverOnly
+      .audience(SERVER)
+      .immutable
       .doc("Maximum number of threads in the command execution thread pool for the MySQL " +
         "frontend service")
       .version("1.4.0")
@@ -1244,7 +1393,8 @@ object KyuubiConf {
 
   val FRONTEND_MYSQL_WORKER_KEEPALIVE_TIME: ConfigEntry[Long] =
     buildConf("kyuubi.frontend.mysql.worker.keepalive.time")
-      .serverOnly
+      .audience(SERVER)
+      .immutable
       .doc("Time(ms) that an idle async thread of the command execution thread pool will wait" +
         " for a new task to arrive before terminating in MySQL frontend service")
       .version("1.4.0")
@@ -1254,20 +1404,23 @@ object KyuubiConf {
     buildConf("kyuubi.frontend.trino.bind.host")
       .doc("Hostname or IP of the machine on which to run the TRINO frontend service.")
       .version("1.7.0")
-      .serverOnly
+      .audience(SERVER)
+      .immutable
       .fallbackConf(FRONTEND_BIND_HOST)
 
   val FRONTEND_TRINO_BIND_PORT: ConfigEntry[Int] = buildConf("kyuubi.frontend.trino.bind.port")
     .doc("Port of the machine on which to run the TRINO frontend service.")
     .version("1.7.0")
-    .serverOnly
+    .audience(SERVER)
+    .immutable
     .intConf
     .checkValue(p => p == 0 || (p > 1024 && p < 65535), "Invalid Port number")
     .createWithDefault(10999)
 
   val FRONTEND_TRINO_MAX_WORKER_THREADS: ConfigEntry[Int] =
     buildConf("kyuubi.frontend.trino.max.worker.threads")
-      .serverOnly
+      .audience(SERVER)
+      .immutable
       .doc("Maximum number of threads in the frontend worker thread pool for the Trino " +
         "frontend service")
       .version("1.7.0")
@@ -1275,7 +1428,8 @@ object KyuubiConf {
 
   val FRONTEND_TRINO_JETTY_STOP_TIMEOUT: ConfigEntry[Long] =
     buildConf("kyuubi.frontend.trino.jetty.stopTimeout")
-      .serverOnly
+      .audience(SERVER)
+      .immutable
       .doc("Stop timeout for Jetty server used by the Trino frontend service.")
       .version("1.8.1")
       .timeConf
@@ -1291,7 +1445,8 @@ object KyuubiConf {
 
   val KUBERNETES_CONTEXT_ALLOW_LIST: ConfigEntry[Set[String]] =
     buildConf("kyuubi.kubernetes.context.allow.list")
-      .serverOnly
+      .audience(SERVER)
+      .immutable
       .doc("The allowed kubernetes context list, if it is empty," +
         " there is no kubernetes context limitation.")
       .version("1.8.0")
@@ -1308,7 +1463,8 @@ object KyuubiConf {
 
   val KUBERNETES_NAMESPACE_ALLOW_LIST: ConfigEntry[Set[String]] =
     buildConf("kyuubi.kubernetes.namespace.allow.list")
-      .serverOnly
+      .audience(SERVER)
+      .immutable
       .doc("The allowed kubernetes namespace list, if it is empty," +
         " there is no kubernetes namespace limitation.")
       .version("1.8.0")
@@ -1323,7 +1479,8 @@ object KyuubiConf {
         " any Kubernetes resource changes after startup. It is highly recommend to set it for" +
         " multiple Kyuubi instances mode. The format is `context1:namespace1,context2:namespace2`.")
       .version("1.11.0")
-      .serverOnly
+      .audience(SERVER)
+      .immutable
       .stringConf
       .toSequence()
       .createWithDefault(Nil)
@@ -1888,7 +2045,8 @@ object KyuubiConf {
         " is no limitation for that. And please use absolute paths." +
         " Also, currently this config takes effect only for Spark engine.")
       .version("1.6.0")
-      .serverOnly
+      .audience(SERVER)
+      .immutable
       .stringConf
       .checkValue(dir => dir.startsWith(File.separator), "the dir should be absolute path")
       .transform(dir => dir.stripSuffix(File.separator) + File.separator)
@@ -1900,7 +2058,8 @@ object KyuubiConf {
       .doc(s"A comma-separated list of additional Spark parameters for which Kyuubi checks " +
         s"whether the upload path is included in ${SESSION_LOCAL_DIR_ALLOW_LIST.key}.")
       .version("1.12.0")
-      .serverOnly
+      .audience(SERVER)
+      .immutable
       .stringConf
       .toSet()
       .createWithDefault(Set.empty)
@@ -1936,7 +2095,8 @@ object KyuubiConf {
 
   val BATCH_INTERNAL_REST_CLIENT_SOCKET_TIMEOUT: ConfigEntry[Long] =
     buildConf("kyuubi.batch.internal.rest.client.socket.timeout")
-      .serverOnly
+      .audience(SERVER)
+      .immutable
       .internal
       .doc("The internal rest client socket timeout used for batch request redirection across" +
         " Kyuubi instances.")
@@ -1945,7 +2105,8 @@ object KyuubiConf {
 
   val BATCH_INTERNAL_REST_CLIENT_CONNECT_TIMEOUT: ConfigEntry[Long] =
     buildConf("kyuubi.batch.internal.rest.client.connect.timeout")
-      .serverOnly
+      .audience(SERVER)
+      .immutable
       .internal
       .doc("The internal rest client connect timeout used for batch request redirection across" +
         " Kyuubi instances.")
@@ -1954,7 +2115,8 @@ object KyuubiConf {
 
   val BATCH_INTERNAL_REST_CLIENT_REQUEST_MAX_ATTEMPTS: ConfigEntry[Int] =
     buildConf("kyuubi.batch.internal.rest.client.request.max.attempts")
-      .serverOnly
+      .audience(SERVER)
+      .immutable
       .internal
       .doc("The internal rest client max attempts number for batch request redirection across" +
         " Kyuubi instances.")
@@ -1964,7 +2126,8 @@ object KyuubiConf {
 
   val BATCH_INTERNAL_REST_CLIENT_REQUEST_ATTEMPT_WAIT: ConfigEntry[Long] =
     buildConf("kyuubi.batch.internal.rest.client.request.attempt.wait")
-      .serverOnly
+      .audience(SERVER)
+      .immutable
       .internal
       .doc(
         "The internal rest client wait time between attempts for batch request redirection " +
@@ -1987,7 +2150,8 @@ object KyuubiConf {
 
   val BATCH_RESOURCE_UPLOAD_ENABLED: ConfigEntry[Boolean] =
     buildConf("kyuubi.batch.resource.upload.enabled")
-      .serverOnly
+      .audience(SERVER)
+      .immutable
       .internal
       .doc("Whether to enable Kyuubi batch resource upload function.")
       .version("1.7.1")
@@ -1999,7 +2163,8 @@ object KyuubiConf {
       .doc("The maximum size in bytes of the uploaded resource file" +
         " when creating batch. 0 or negative value means no limit.")
       .version("1.10.0")
-      .serverOnly
+      .audience(SERVER)
+      .immutable
       .longConf
       .createWithDefault(0)
 
@@ -2008,14 +2173,16 @@ object KyuubiConf {
       .doc("The maximum size in bytes of each uploaded extra resource file" +
         " when creating batch. 0 or negative value means no limit.")
       .version("1.10.0")
-      .serverOnly
+      .audience(SERVER)
+      .immutable
       .longConf
       .createWithDefault(0)
 
   val BATCH_SUBMITTER_ENABLED: ConfigEntry[Boolean] =
     buildConf("kyuubi.batch.submitter.enabled")
       .internal
-      .serverOnly
+      .audience(SERVER)
+      .immutable
       .doc("Batch API v2 requires batch submitter to pick the INITIALIZED batch job " +
         "from metastore and submits it to Resource Manager. " +
         "Note: Batch API v2 is experimental and under rapid development, this configuration " +
@@ -2028,7 +2195,8 @@ object KyuubiConf {
   val BATCH_SUBMITTER_THREADS: ConfigEntry[Int] =
     buildConf("kyuubi.batch.submitter.threads")
       .internal
-      .serverOnly
+      .audience(SERVER)
+      .immutable
       .doc("Number of threads in batch job submitter, this configuration only take effects " +
         s"when ${BATCH_SUBMITTER_ENABLED.key} is enabled")
       .version("1.8.0")
@@ -2038,7 +2206,8 @@ object KyuubiConf {
   val BATCH_IMPL_VERSION: ConfigEntry[String] =
     buildConf("kyuubi.batch.impl.version")
       .internal
-      .serverOnly
+      .audience(SERVER)
+      .immutable
       .doc("Batch API version, candidates: 1, 2. Only take effect when " +
         s"${BATCH_SUBMITTER_ENABLED.key} is true, otherwise always use v1 implementation. " +
         "Note: Batch API v2 is experimental and under rapid development, this configuration " +
@@ -2049,7 +2218,8 @@ object KyuubiConf {
       .createWithDefault("1")
 
   val BATCH_INFO_INTERNAL_REDIRECT = buildConf("kyuubi.batch.info.internal.redirect")
-    .serverOnly
+    .audience(SERVER)
+    .immutable
     .doc("When set to true, the batch info is retrieved by forwarding the request to the " +
       "Kyuubi instance that submitted this job via internal RPC. If false, the batch info is " +
       "constructed directly from the metadata store. It is recommended to set this to false to " +
@@ -2095,7 +2265,8 @@ object KyuubiConf {
 
   val METADATA_MAX_AGE: ConfigEntry[Long] =
     buildConf("kyuubi.metadata.max.age")
-      .serverOnly
+      .audience(SERVER)
+      .immutable
       .doc("The maximum age of metadata, the metadata exceeding the age will be cleaned.")
       .version("1.6.0")
       .timeConf
@@ -2103,7 +2274,8 @@ object KyuubiConf {
 
   val METADATA_CLEANER_INTERVAL: ConfigEntry[Long] =
     buildConf("kyuubi.metadata.cleaner.interval")
-      .serverOnly
+      .audience(SERVER)
+      .immutable
       .doc("The interval to check and clean expired metadata.")
       .version("1.6.0")
       .timeConf
@@ -2111,7 +2283,8 @@ object KyuubiConf {
 
   val METADATA_CLEANER_BATCH_SIZE: ConfigEntry[Int] =
     buildConf("kyuubi.metadata.cleaner.batch.size")
-      .serverOnly
+      .audience(SERVER)
+      .immutable
       .doc("The batch size for cleaning expired metadata. " +
         "This is used to avoid holding the delete lock for a long time " +
         "when there are too many expired metadata to be cleaned.")
@@ -2121,7 +2294,8 @@ object KyuubiConf {
 
   val METADATA_CLEANER_BATCH_INTERVAL: ConfigEntry[Long] =
     buildConf("kyuubi.metadata.cleaner.batch.interval")
-      .serverOnly
+      .audience(SERVER)
+      .immutable
       .internal
       .doc("The interval to wait before next batch of cleaning expired metadata.")
       .timeConf
@@ -2129,7 +2303,8 @@ object KyuubiConf {
 
   val METADATA_RECOVERY_THREADS: ConfigEntry[Int] =
     buildConf("kyuubi.metadata.recovery.threads")
-      .serverOnly
+      .audience(SERVER)
+      .immutable
       .doc("The number of threads for recovery from the metadata store " +
         "when the Kyuubi server restarts.")
       .version("1.6.0")
@@ -2138,7 +2313,8 @@ object KyuubiConf {
 
   val METADATA_RECOVERY_WAIT_ENGINE_SUBMISSION: ConfigEntry[Boolean] =
     buildConf("kyuubi.metadata.recovery.waitEngineSubmission")
-      .serverOnly
+      .audience(SERVER)
+      .immutable
       .doc("Whether a metadata recovery task should wait for its corresponding engine " +
         "submission to complete before finishing. All recovery tasks are submitted to a fixed " +
         s"thread pool controlled by ${METADATA_RECOVERY_THREADS.key}. If true, a task blocks " +
@@ -2151,7 +2327,8 @@ object KyuubiConf {
 
   val METADATA_REQUEST_RETRY_INTERVAL: ConfigEntry[Long] =
     buildConf("kyuubi.metadata.request.retry.interval")
-      .serverOnly
+      .audience(SERVER)
+      .immutable
       .doc("The interval to check and trigger the metadata request retry tasks.")
       .version("1.6.0")
       .timeConf
@@ -2159,7 +2336,8 @@ object KyuubiConf {
 
   val METADATA_REQUEST_ASYNC_RETRY_ENABLED: ConfigEntry[Boolean] =
     buildConf("kyuubi.metadata.request.async.retry.enabled")
-      .serverOnly
+      .audience(SERVER)
+      .immutable
       .doc("Whether to retry in async when metadata request failed. When true, return " +
         "success response immediately even the metadata request failed, and schedule " +
         "it in background until success, to tolerate long-time metadata store outages " +
@@ -2170,7 +2348,8 @@ object KyuubiConf {
 
   val METADATA_REQUEST_ASYNC_RETRY_THREADS: ConfigEntry[Int] =
     buildConf("kyuubi.metadata.request.async.retry.threads")
-      .serverOnly
+      .audience(SERVER)
+      .immutable
       .withAlternative("kyuubi.metadata.request.retry.threads")
       .doc("Number of threads in the metadata request async retry manager thread pool. Only " +
         s"take affect when ${METADATA_REQUEST_ASYNC_RETRY_ENABLED.key} is `true`.")
@@ -2180,7 +2359,8 @@ object KyuubiConf {
 
   val METADATA_REQUEST_ASYNC_RETRY_QUEUE_SIZE: ConfigEntry[Int] =
     buildConf("kyuubi.metadata.request.async.retry.queue.size")
-      .serverOnly
+      .audience(SERVER)
+      .immutable
       .withAlternative("kyuubi.metadata.request.retry.queue.size")
       .doc("The maximum queue size for buffering metadata requests in memory when the external" +
         " metadata storage is down. Requests will be dropped if the queue exceeds. Only" +
@@ -2191,7 +2371,8 @@ object KyuubiConf {
 
   val METADATA_SEARCH_WINDOW: OptionalConfigEntry[Long] =
     buildConf("kyuubi.metadata.search.window")
-      .serverOnly
+      .audience(SERVER)
+      .immutable
       .doc("The time window to restrict user queries to metadata within a specific period, " +
         "starting from the current time to the past. It only affects `GET /api/v1/batches` API. " +
         "You may want to set this to short period to improve query performance and reduce load " +
@@ -2294,7 +2475,8 @@ object KyuubiConf {
     buildConf("kyuubi.operation.query.timeout.monitor.enabled")
       .doc("Whether to monitor timeout query timeout check on server side.")
       .version("1.8.0")
-      .serverOnly
+      .audience(SERVER)
+      .immutable
       .internal
       .booleanConf
       .createWithDefault(true)
@@ -2376,7 +2558,8 @@ object KyuubiConf {
     buildConf("kyuubi.operation.log.dir.root")
       .doc("Root directory for query operation log at server-side.")
       .version("1.4.0")
-      .serverOnly
+      .audience(SERVER)
+      .immutable
       .stringConf
       .createWithDefault("server_operation_logs")
 
@@ -2518,7 +2701,8 @@ object KyuubiConf {
     .doc("This parameter is introduced as a server-side parameter " +
       "controlling the upper limit of the engine pool.")
     .version("1.4.0")
-    .serverOnly
+    .audience(SERVER)
+    .immutable
     .intConf
     .checkValue(s => s > 0 && s < 33, "Invalid engine pool threshold, it should be in [1, 32]")
     .createWithDefault(9)
@@ -2658,7 +2842,8 @@ object KyuubiConf {
     buildConf("kyuubi.backend.server.event.json.log.path")
       .doc("The location of server events go for the built-in JSON logger")
       .version("1.4.0")
-      .serverOnly
+      .audience(SERVER)
+      .immutable
       .stringConf
       .createWithDefault("file:///tmp/kyuubi/events")
 
@@ -2686,7 +2871,8 @@ object KyuubiConf {
     buildConf("kyuubi.backend.server.event.kafka.topic")
       .doc("The topic of server events go for the built-in Kafka logger")
       .version("1.8.0")
-      .serverOnly
+      .audience(SERVER)
+      .immutable
       .stringConf
       .createOptional
 
@@ -2694,7 +2880,8 @@ object KyuubiConf {
     buildConf("kyuubi.backend.server.event.kafka.close.timeout")
       .doc("Period to wait for Kafka producer of server event handlers to close.")
       .version("1.8.0")
-      .serverOnly
+      .audience(SERVER)
+      .immutable
       .timeConf
       .createWithDefault(Duration.ofMillis(5000).toMillis)
 
@@ -2718,7 +2905,8 @@ object KyuubiConf {
         " which is a child of org.apache.kyuubi.events.handler.CustomEventHandlerProvider" +
         " which has a zero-arg constructor.")
       .version("1.4.0")
-      .serverOnly
+      .audience(SERVER)
+      .immutable
       .stringConf
       .transformToUpperCase
       .toSequence()
@@ -2731,7 +2919,8 @@ object KyuubiConf {
     buildConf("kyuubi.backend.server.event.async.enabled")
       .doc("Whether backend server event logging is asynchronous.")
       .version("1.11.0")
-      .serverOnly
+      .audience(SERVER)
+      .immutable
       .booleanConf
       .createWithDefault(false)
 
@@ -3071,13 +3260,15 @@ object KyuubiConf {
     buildConf("kyuubi.server.name")
       .doc("The name of Kyuubi Server.")
       .version("1.5.0")
-      .serverOnly
+      .audience(SERVER)
+      .immutable
       .stringConf
       .createOptional
 
   val SERVER_INFO_PROVIDER: ConfigEntry[String] =
     buildConf("kyuubi.server.info.provider")
-      .serverOnly
+      .audience(SERVER)
+      .immutable
       .doc("The server information provider name, some clients may rely on this information" +
         " to check the server compatibilities and functionalities." +
         " <li>SERVER: Return Kyuubi server information.</li>" +
@@ -3089,7 +3280,8 @@ object KyuubiConf {
   val SERVER_ONLY_PREFIXES: ConfigEntry[Set[String]] =
     buildConf("kyuubi.config.server.only.prefixes")
       .internal
-      .serverOnly
+      .audience(SERVER)
+      .immutable
       .doc("A comma-separated list of prefixes for server-only configs. It's used to filter out " +
         "the server-only configs to prevent passing them to the engine end. Note that, " +
         "it only take affects for the configs that is not defined as a Kyuubi ConfigEntry. " +
@@ -3347,7 +3539,8 @@ object KyuubiConf {
       .doc("Maximum kyuubi server connections per user." +
         " Any user exceeding this limit will not be allowed to connect.")
       .version("1.6.0")
-      .serverOnly
+      .audience(SERVER)
+      .immutable
       .intConf
       .createOptional
 
@@ -3356,7 +3549,8 @@ object KyuubiConf {
       .doc("Maximum kyuubi server connections per ipaddress." +
         " Any user exceeding this limit will not be allowed to connect.")
       .version("1.6.0")
-      .serverOnly
+      .audience(SERVER)
+      .immutable
       .intConf
       .createOptional
 
@@ -3365,7 +3559,8 @@ object KyuubiConf {
       .doc("Maximum kyuubi server connections per user:ipaddress combination." +
         " Any user-ipaddress exceeding this limit will not be allowed to connect.")
       .version("1.6.0")
-      .serverOnly
+      .audience(SERVER)
+      .immutable
       .intConf
       .createOptional
 
@@ -3373,7 +3568,8 @@ object KyuubiConf {
     buildConf("kyuubi.server.limit.connections.user.unlimited.list")
       .doc("The maximum connections of the user in the white list will not be limited.")
       .version("1.7.0")
-      .serverOnly
+      .audience(SERVER)
+      .immutable
       .stringConf
       .toSet()
       .createWithDefault(Set.empty)
@@ -3384,7 +3580,8 @@ object KyuubiConf {
         "if the user has configured both user.unlimited.list and user.deny.list, " +
         "the priority of the latter is higher.")
       .version("1.8.0")
-      .serverOnly
+      .audience(SERVER)
+      .immutable
       .stringConf
       .toSet()
       .createWithDefault(Set.empty)
@@ -3393,7 +3590,8 @@ object KyuubiConf {
     buildConf("kyuubi.server.limit.connections.ip.deny.list")
       .doc("The client ip in the deny list will be denied to connect to kyuubi server.")
       .version("1.9.1")
-      .serverOnly
+      .audience(SERVER)
+      .immutable
       .stringConf
       .toSet()
       .createWithDefault(Set.empty)
@@ -3403,7 +3601,8 @@ object KyuubiConf {
       .doc("Maximum kyuubi server batch connections per user." +
         " Any user exceeding this limit will not be allowed to connect.")
       .version("1.7.0")
-      .serverOnly
+      .audience(SERVER)
+      .immutable
       .intConf
       .createOptional
 
@@ -3412,7 +3611,8 @@ object KyuubiConf {
       .doc("Maximum kyuubi server batch connections per ipaddress." +
         " Any user exceeding this limit will not be allowed to connect.")
       .version("1.7.0")
-      .serverOnly
+      .audience(SERVER)
+      .immutable
       .intConf
       .createOptional
 
@@ -3421,7 +3621,8 @@ object KyuubiConf {
       .doc("Maximum kyuubi server batch connections per user:ipaddress combination." +
         " Any user-ipaddress exceeding this limit will not be allowed to connect.")
       .version("1.7.0")
-      .serverOnly
+      .audience(SERVER)
+      .immutable
       .intConf
       .createOptional
 
@@ -3430,7 +3631,8 @@ object KyuubiConf {
       .doc("Max rows limit for getting result row set operation. If the max rows specified " +
         "by client-side is larger than the limit, request will fail directly.")
       .version("1.8.0")
-      .serverOnly
+      .audience(SERVER)
+      .immutable
       .intConf
       .createOptional
 
@@ -3444,7 +3646,8 @@ object KyuubiConf {
 
   val SERVER_SECRET_REDACTION_PATTERN: OptionalConfigEntry[Regex] =
     buildConf("kyuubi.server.redaction.regex")
-      .serverOnly
+      .audience(SERVER)
+      .immutable
       .doc("Regex to decide which Kyuubi contain sensitive information. When this regex matches " +
         "a property key or value, the value is redacted from the various logs.")
       .version("1.6.0")
@@ -3453,7 +3656,8 @@ object KyuubiConf {
 
   val SERVER_CONF_RETRIEVE_MODE: ConfigEntry[String] =
     buildConf("kyuubi.server.conf.retrieveMode")
-      .serverOnly
+      .audience(SERVER)
+      .immutable
       .doc("Controls how session configurations are returned in REST API responses. " +
         "Supported values: " +
         "<ul>" +
@@ -3468,7 +3672,8 @@ object KyuubiConf {
 
   val FRONTEND_REST_SESSION_LIST_LEGACY_MODE: ConfigEntry[Boolean] =
     buildConf("kyuubi.frontend.rest.legacy.v1.sessionsReturnAllUsers")
-      .serverOnly
+      .audience(SERVER)
+      .immutable
       .doc("When true, GET /api/v1/sessions returns all sessions on the server regardless " +
         "of the calling user (legacy behavior). When false (default), only sessions owned " +
         "by the authenticated user are returned. " +
@@ -3481,7 +3686,8 @@ object KyuubiConf {
     buildConf("kyuubi.server.periodicGC.interval")
       .doc("How often to trigger the periodic garbage collection. 0 will disable it.")
       .version("1.7.0")
-      .serverOnly
+      .audience(SERVER)
+      .immutable
       .timeConf
       .createWithDefaultString("PT30M")
 
@@ -3489,7 +3695,8 @@ object KyuubiConf {
     buildConf("kyuubi.server.tempFile.expireTime")
       .doc("Expiration timout for cleanup server-side temporary files, e.g. operation logs.")
       .version("1.10.0")
-      .serverOnly
+      .audience(SERVER)
+      .immutable
       .timeConf
       .createWithDefaultString("P30D")
 
@@ -3497,7 +3704,8 @@ object KyuubiConf {
     buildConf("kyuubi.server.tempFile.maxCount")
       .doc("The upper threshold size of server-side temporary file paths to cleanup")
       .version("1.10.0")
-      .serverOnly
+      .audience(SERVER)
+      .immutable
       .intConf
       .createOptional
 
@@ -3508,7 +3716,8 @@ object KyuubiConf {
         s"security mechanism is enabled. Note, when ${AUTHENTICATION_METHOD.key} is " +
         "configured to NOSASL or NONE, everyone is treated as administrator.")
       .version("1.8.0")
-      .serverOnly
+      .audience(SERVER)
+      .immutable
       .stringConf
       .toSet()
       .createWithDefault(Set.empty)
@@ -4079,7 +4288,8 @@ object KyuubiConf {
         " this configuration is used to limit the number of engine startup processes" +
         " running at the same time to avoid it.")
       .version("1.8.0")
-      .serverOnly
+      .audience(SERVER)
+      .immutable
       .intConf
       .createOptional
 
@@ -4109,7 +4319,8 @@ object KyuubiConf {
         s" for `kyuubi.server.thrift.resultset.default.fetch.size`.")
       .version("1.9.1")
       .internal
-      .serverOnly
+      .audience(SERVER)
+      .immutable
       .intConf
       .createWithDefault(1000)
 
@@ -4119,6 +4330,7 @@ object KyuubiConf {
         " specified by the client. Respect `hive.server2.thrift.resultset.default.fetch.size`" +
         " hive conf.")
       .version("1.9.1")
-      .serverOnly
+      .audience(SERVER)
+      .immutable
       .fallbackConf(HIVE_SERVER2_THRIFT_RESULTSET_DEFAULT_FETCH_SIZE)
 }
